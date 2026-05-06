@@ -18,12 +18,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 srcdir = "E:/SJTU/实习/国泰海通/业绩回测/nav"
+expdir = "E:/SJTU/实习/国泰海通/barra因子/result/管理人暴露/excess_exposure"
 desdir = "E:/SJTU/实习/国泰海通/业绩回测/result"
 
 FACTOR_COLUMNS = [
-    'fund_ret', 'pure_alpha', 'beta', 'book_to_price', 'comovement', 
+    'fund_ret', 'pure_alpha', 'style_ret', 'beta', 'book_to_price', 'comovement', 
     'earnings_yield', 'growth', 'leverage', 'liquidity', 
     'momentum', 'non_linear_size', 'residual_volatility', 'size'
+]
+
+STYLE_FACTORS = [
+    'beta', 'book_to_price', 'comovement', 'earnings_yield', 'growth', 
+    'leverage', 'liquidity', 'momentum', 'non_linear_size', 'residual_volatility', 'size'
 ]
 
 RF = 0.015
@@ -55,10 +61,10 @@ def calculate_metrics(nav_series, benchmark_returns=None):
         return None
     
     total_return = nav_series.iloc[-1] / nav_series.iloc[0] - 1
-    days = len(nav_series)
-    annualized_return = (1 + total_return) ** (240 / days) - 1
+    weeks = len(nav_series)
+    annualized_return = (1 + total_return) ** (52 / weeks) - 1
     
-    volatility = returns.std() * np.sqrt(240)
+    volatility = returns.std() * np.sqrt(52)
     
     sharpe_ratio = (annualized_return - RF) / volatility if volatility != 0 else np.nan
     
@@ -82,10 +88,10 @@ def calculate_metrics(nav_series, benchmark_returns=None):
         common_dates = aligned_returns.index.intersection(aligned_benchmark.index)
         if len(common_dates) >= 2:
             excess_returns = aligned_returns.loc[common_dates] - aligned_benchmark.loc[common_dates]
-            tracking_error = excess_returns.std() * np.sqrt(240)
+            tracking_error = excess_returns.std() * np.sqrt(52)
             
             excess_return = (1 + excess_returns).prod() - 1
-            excess_annualized = (1 + excess_return) ** (240 / len(common_dates)) - 1
+            excess_annualized = (1 + excess_return) ** (52 / len(common_dates)) - 1
             
             information_ratio = excess_annualized / tracking_error if tracking_error != 0 else np.nan
             
@@ -136,6 +142,79 @@ def process_fund(fund_data, benchmark_returns=None):
     
     return fund_results
 
+def process_exposure_data():
+    logger.info("开始处理暴露数据")
+    
+    import glob
+    
+    exposure_files = glob.glob(f"{expdir}/*_relative_exposure.xlsx")
+    logger.info(f"发现 {len(exposure_files)} 个暴露文件")
+    
+    if len(exposure_files) == 0:
+        logger.warning("未找到任何暴露文件")
+        return
+    
+    all_results = {'full_period': {}}
+    all_years = set()
+    
+    for file_path in exposure_files:
+        product_name = os.path.basename(file_path).replace('_relative_exposure.xlsx', '')
+        logger.info(f"处理产品: {product_name}")
+        
+        try:
+            df = pd.read_excel(file_path, index_col=0)
+            df.index = pd.to_datetime(df.index)
+            
+            available_factors = [f for f in STYLE_FACTORS if f in df.columns]
+            if not available_factors:
+                logger.warning(f"产品 {product_name} 中没有找到风格因子列")
+                continue
+            
+            abs_exposure = df[available_factors].abs()
+            
+            all_results['full_period'][product_name] = {}
+            for factor in available_factors:
+                all_results['full_period'][product_name][factor] = abs_exposure[factor].mean()
+            all_results['full_period'][product_name]['总和'] = abs_exposure[available_factors].mean().sum()
+            
+            years = df.index.year.unique()
+            all_years.update(years)
+            
+            for year in years:
+                year_key = f'year_{year}'
+                if year_key not in all_results:
+                    all_results[year_key] = {}
+                
+                year_data = df[df.index.year == year]
+                year_abs = year_data[available_factors].abs()
+                
+                all_results[year_key][product_name] = {}
+                for factor in available_factors:
+                    all_results[year_key][product_name][factor] = year_abs[factor].mean()
+                all_results[year_key][product_name]['总和'] = year_abs[available_factors].mean().sum()
+                
+        except Exception as e:
+            logger.error(f"处理文件 {file_path} 失败: {e}")
+    
+    all_years = sorted(all_years)
+    
+    output_file = f"{desdir}/exposure_summary.xlsx"
+    
+    with pd.ExcelWriter(output_file) as writer:
+        for period in ['full_period'] + [f'year_{y}' for y in all_years]:
+            if period == 'full_period':
+                sheet_name = '成立以来'
+            else:
+                sheet_name = period.replace('year_', '')
+            
+            if all_results.get(period):
+                df = pd.DataFrame(all_results[period]).T
+                df.index.name = 'product'
+                df = df[STYLE_FACTORS + ['总和']]
+                df.to_excel(writer, sheet_name=sheet_name)
+    
+    logger.info(f"暴露数据汇总已保存到 {output_file}")
+
 def main():
     logger.info("开始处理 Barra Alpha 回测")
     
@@ -183,33 +262,35 @@ def main():
                 
                 factor_results[factor][period][fund] = metrics
     
-    for factor in FACTOR_COLUMNS:
-        has_data = False
-        for period in ['full_period'] + [f'year_{y}' for y in all_years]:
-            if factor_results[factor][period]:
-                has_data = True
-                break
+    # for factor in FACTOR_COLUMNS:
+    #     has_data = False
+    #     for period in ['full_period'] + [f'year_{y}' for y in all_years]:
+    #         if factor_results[factor][period]:
+    #             has_data = True
+    #             break
         
-        if not has_data:
-            logger.warning(f"因子 {factor} 没有有效数据，跳过")
-            continue
+    #     if not has_data:
+    #         logger.warning(f"因子 {factor} 没有有效数据，跳过")
+    #         continue
         
-        output_file = f"{desdir}/中证500指增_{factor}_backtest.xlsx"
-        with pd.ExcelWriter(output_file) as writer:
-            for period in ['full_period'] + [f'year_{y}' for y in all_years]:
-                if period == 'full_period':
-                    sheet_name = '成立以来'
-                else:
-                    sheet_name = period.replace('year_', '')
+    #     output_file = f"{desdir}/中证500指增_{factor}_backtest.xlsx"
+    #     with pd.ExcelWriter(output_file) as writer:
+    #         for period in ['full_period'] + [f'year_{y}' for y in all_years]:
+    #             if period == 'full_period':
+    #                 sheet_name = '成立以来'
+    #             else:
+    #                 sheet_name = period.replace('year_', '')
                 
-                if factor_results[factor][period]:
-                    df = pd.DataFrame(factor_results[factor][period]).T
-                    df.index.name = 'fund'
-                    df.to_excel(writer, sheet_name=sheet_name)
+    #             if factor_results[factor][period]:
+    #                 df = pd.DataFrame(factor_results[factor][period]).T
+    #                 df.index.name = 'fund'
+    #                 df.to_excel(writer, sheet_name=sheet_name)
         
-        logger.info(f"已保存因子 {factor} 的结果到 {output_file}")
+    #     logger.info(f"已保存因子 {factor} 的结果到 {output_file}")
     
-    logger.info("处理完成")
+    # logger.info("处理完成")
+    
+    process_exposure_data()
 
 if __name__ == "__main__":
     main()
